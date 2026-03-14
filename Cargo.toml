@@ -1,0 +1,9 @@
+[package]
+name = "ondemand-kmod"
+version = "0.1.0"
+edition = "2021"
+description = "On-demand kernel module loading and unloading framework"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
