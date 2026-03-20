@@ -31,17 +31,7 @@ enum LoadAction {
 // ModuleRegistry
 // ---------------------------------------------------------------------------
 
-/// The central registry for on-demand kernel modules.
-///
-/// Generic over `L: ModuleLoader` to allow different loading backends
-/// (e.g., `kmod::init_module` for StarryOS, or a mock for testing).
-///
-/// # Thread safety
-///
-/// All methods are safe to call concurrently. Internal state is protected
-/// by a spinlock. The lock is **not** held during actual module loading or
-/// unloading (which may involve disk I/O); it is only held for brief
-/// state transitions.
+/// The central registry for on-demand kernel modules
 pub struct ModuleRegistry<L: ModuleLoader> {
     pub(crate) modules: Mutex<Vec<ManagedModule>>,
     pub(crate) loader: L,
@@ -57,10 +47,6 @@ impl<L: ModuleLoader> ModuleRegistry<L> {
     }
 
     /// Register a module for on-demand loading.
-    ///
-    /// The module will not be loaded until an access event matches its
-    /// trigger. Returns `true` on success, `false` if a module with the
-    /// same name is already registered.
     pub fn register(&self, desc: ModuleDesc) -> bool {
         let mut modules = self.modules.lock();
         if modules.iter().any(|m| m.desc.name == desc.name) {
