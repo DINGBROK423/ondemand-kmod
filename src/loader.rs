@@ -11,22 +11,16 @@ pub enum LoadError {
     NotFound,
     /// The `.ko` file is not a valid module.
     InvalidModule,
-    /// The module's `init` function returned an error.
     InitFailed(i32),
-    /// An unspecified error occurred.
     Other,
 }
 
 /// Error returned by [`ModuleLoader::unload`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnloadError {
-    /// The module is still in use and cannot be unloaded.
     InUse,
-    /// The module is not currently loaded.
     NotLoaded,
-    /// The module's `exit` function failed.
     ExitFailed,
-    /// An unspecified error occurred.
     Other,
 }
 

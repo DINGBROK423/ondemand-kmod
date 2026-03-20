@@ -10,20 +10,13 @@
 /// loaded in response to this event.
 #[derive(Debug, Clone)]
 pub enum AccessEvent<'a> {
-    /// A file path was accessed (e.g., `open("/proc/meminfo")`).
     Path(&'a str),
-    /// A system call was invoked by number.
     Syscall(usize),
-    /// A device node was accessed (e.g., `/dev/null_blk0`).
     Device(&'a str),
 }
 
 /// Determines whether an [`AccessEvent`] should trigger loading of a module.
-///
-/// Implementations must be `Send + Sync` because the registry may be accessed
-/// from multiple threads concurrently.
 pub trait Trigger: Send + Sync {
-    /// Returns `true` if `event` matches this trigger's criteria.
     fn matches(&self, event: &AccessEvent) -> bool;
 }
 
@@ -32,16 +25,6 @@ pub trait Trigger: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Triggers when a file path matches a prefix with path-boundary awareness.
-///
-/// # Examples
-///
-/// `PathPrefixTrigger::new("/proc")` matches:
-/// - `"/proc"` (exact match)
-/// - `"/proc/meminfo"` (sub-path)
-///
-/// But does **not** match:
-/// - `"/process"` (not at a path boundary)
-/// - `"/dev/proc"` (different prefix)
 pub struct PathPrefixTrigger {
     prefix: &'static str,
 }
@@ -67,13 +50,6 @@ impl Trigger for PathPrefixTrigger {
 }
 
 /// Triggers when a specific system call number is invoked.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Trigger loading of the eBPF module when SYS_bpf is called
-/// SyscallTrigger::new(321) // SYS_bpf on riscv64
-/// ```
 pub struct SyscallTrigger {
     sysno: usize,
 }
@@ -92,9 +68,6 @@ impl Trigger for SyscallTrigger {
 }
 
 /// Triggers when a device path matches a prefix.
-///
-/// Works identically to [`PathPrefixTrigger`] but only matches
-/// [`AccessEvent::Device`] events.
 pub struct DeviceTrigger {
     prefix: &'static str,
 }

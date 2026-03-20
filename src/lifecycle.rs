@@ -11,93 +11,42 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::loader::UsageChecker;
 use crate::trigger::Trigger;
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
 /// Lifecycle state of a managed module.
-///
-/// ```text
-/// Registered ──on_access──► Loading ──success──► Active
-///                             │                  │    ▲
-///                           fail                 │    │
-///                             ▼         tick()   │  on_access
-///                          Unloaded ◄── Unloading │    │
-///                             ▲           ▲      ▼    │
-///                             │           └── Idle ───┘
-///                           on_access
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Registered but never loaded. Waiting for first access.
     Registered,
-    /// Currently being loaded by a thread. Other accessors should retry.
     Loading,
-    /// Loaded and available. May have active references.
     Active,
-    /// Loaded but idle (zero references). Idle timer is running.
     Idle,
-    /// Currently being unloaded by the monitor.
     Unloading,
-    /// Was loaded previously but has been unloaded. Will be reloaded on next
-    /// matching access.
     Unloaded,
 }
 
-// ---------------------------------------------------------------------------
-// ModuleDesc
-// ---------------------------------------------------------------------------
-
-/// Describes a module available for on-demand loading.
+/// User-provided descriptor for a managed module.
 pub struct ModuleDesc {
-    /// Unique module name (e.g., `"procfs"`).
     pub name: &'static str,
-    /// Path to the `.ko` file on disk (e.g., `"/root/modules/procfs.ko"`).
     pub ko_path: &'static str,
-    /// Idle timeout in abstract ticks. After this many ticks of inactivity
-    /// with zero references, the module may be automatically unloaded.
-    ///
-    /// Set to `0` to disable automatic unloading for this module.
     pub idle_timeout_ticks: u64,
+
     /// Trigger that determines when this module should be loaded.
     pub trigger: Box<dyn Trigger>,
-    /// Optional checker for module-specific usage tracking.
-    ///
-    /// If `None`, the module is considered safe to unload whenever its
-    /// reference count reaches zero.
     pub usage: Option<Box<dyn UsageChecker>>,
 }
-
-// ---------------------------------------------------------------------------
-// AccessResult
-// ---------------------------------------------------------------------------
 
 /// Result of an `on_access` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessResult {
-    /// No registered module matches the event.
     NoMatch,
-    /// The module is loaded and ready (was already loaded or just loaded).
     Loaded,
-    /// Another thread is currently loading the module. The caller should
-    /// yield and retry.
     Loading,
-    /// The module failed to load.
     LoadFailed,
-    /// The module is currently being unloaded; try again later.
     Unavailable,
 }
-
-// ---------------------------------------------------------------------------
-// ModuleInfo
-// ---------------------------------------------------------------------------
 
 /// Read-only snapshot of a managed module's state.
 #[derive(Debug, Clone)]
 pub struct ModuleInfo {
-    /// Module name.
     pub name: &'static str,
-    /// Current lifecycle state.
     pub state: State,
     /// Number of active references (guards).
     pub ref_count: usize,
@@ -153,12 +102,10 @@ pub(crate) struct ManagedModule {
     pub(crate) state: State,
     /// Opaque handle returned by [`ModuleLoader::load`].
     pub(crate) loaded_handle: Option<u64>,
-    /// Shared atomic reference count; cloned into [`ModuleGuard`]s.
     pub(crate) ref_count: Arc<AtomicUsize>,
     /// Tick at which the module was first observed idle by
     /// [`IdleMonitor::tick`](crate::monitor::IdleMonitor::tick).
     pub(crate) idle_since_ticks: Option<u64>,
-    /// Tick at which the module was last accessed.
     pub(crate) last_access_ticks: u64,
 }
 

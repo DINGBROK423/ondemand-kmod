@@ -1,3 +1,5 @@
+// cargo test --test registry_flow
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ondemand_kmod::{
