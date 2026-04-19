@@ -6,7 +6,7 @@
 
 StarryOS 作为基于 Rust 的宏内核操作系统，已在前序工作中引入了可加载内核模块（LKM）基础设施，但彼时仅支持显式手动加载。本文在此基础之上，设计并实现了 `ondemand-kmod`——一个通用的 `#![no_std]` 按需加载内核模块框架，支持懒加载（lazy loading）与空闲超时自动卸载（idle unloading）。该框架将"何时加载"的策略与"怎么加载"的机制彻底解耦，形成一个可复用的独立库。
 
-随后，该框架深度集成进 StarryOS，先后实现了 procfs 与 FUSE 两个真实模块的按需加载。在 FUSE 方向，本文从零手写了内核侧驱动 `Starryfuse`，包含完整的 FUSE 协议解析、字符设备通信、VFS 桥接与异步 I/O 支持；将其包装为 `fuse.ko` 可加载模块，并开发了三组用户态测试程序，在 QEMU/RISC-V 环境下验证了从首次 `open("/dev/fuse")` 触发加载到空闲卸载、内存回收的完整生命周期。
+随后，该框架深度集成进 StarryOS，先后实现了 procfs 与 FUSE 两个真实模块的按需加载。在 FUSE 方向，本文从零手写了内核侧驱动 `Starryfuse`，包含基础 FUSE 协议解析、字符设备通信、VFS 桥接与阻塞读/poll 多路复用支持；将其包装为 `fuse.ko` 可加载模块，并开发了三组用户态测试程序，在 QEMU/RISC-V 环境下验证了从首次 `open("/dev/fuse")` 触发加载到空闲卸载、内存回收的完整生命周期。
 
 **关键词**：StarryOS；按需加载内核模块；FUSE；用户态文件系统；Rust；RISC-V
 
@@ -53,8 +53,9 @@ AlloyStack:面向Serverless按需加载的库操作系统。该项目作为libos
 
 - **Rust `#![no_std]` 环境**：无法使用 `std::sync::Mutex`、`std::thread` 等标准库设施，所有并发控制必须基于自旋锁和内核原语。
 - **跨模块符号解析**：模块与主内核之间的符号绑定通过 `KALLSYMS` 字典完成，需要处理 Rust Nightly 裁剪导致的符号缺失问题。
-- **RISC-V QEMU 调试环境**：物理内存有限，模块加载/卸载的内存行为必须可观测、可量化。
+- **RISC-V QEMU 调试环境**：物理内存固定，模块加载/卸载的内存行为需要可观测、可量化，以验证按需加载的实际收益。
 - **VFS 上下文安全**：动态加载的文件系统模块不能在中断上下文或持有全局锁时执行可能阻塞的操作。
+- **缺乏现有 FUSE 内核态驱动 Rust 实现借鉴**：现有 FUSE Rust 实现开源项目仓库均为用户态侧设计，为Linux系统适配。
 
 ---
 
@@ -62,7 +63,7 @@ AlloyStack:面向Serverless按需加载的库操作系统。该项目作为libos
 
 ### 3.1 整体架构
 
-StarryOS 的按需加载系统由两大部分组成：
+StarryOS 的按需加载系统组成部分：
 
 1. **`ondemand-kmod`**：独立的 `#![no_std]` Rust 库，提供通用的模块生命周期管理。
 2. **`api/src/kmod/ondemand.rs`**：StarryOS 内核集成层，桥接框架与现有 LKM 基础设施。
@@ -143,43 +144,43 @@ StarryOS 的按需加载系统由两大部分组成：
 `ondemand-kmod` 被设计为一个独立的 `#![no_std]` Rust crate，核心文件包括：
 
 - **`registry.rs`**：维护一个全局的模块注册表，记录每个模块的名称、触发器（路径前缀或设备号）、`.ko` 文件路径、超时阈值以及当前状态。
-- **`lifecycle.rs`**：实现六状态 FSM 的所有状态转换函数，包括 `try_load()`、`mark_idle()`、`try_unload()` 等。所有状态转换均持有模块级自旋锁，并通过原子变量记录引用计数。
-- **`monitor.rs`**：一个后台任务，周期性地扫描注册表中状态为 `Idle` 的模块。若发现某个模块的空闲时间超过阈值，则调用 `lifecycle::try_unload()` 发起卸载。
+- **`lifecycle.rs`**：定义六状态 FSM 的 `State` 枚举、`ModuleDesc` 模块描述符、`ModuleGuard` RAII 引用计数守卫以及 `ManagedModule` 运行时 bookkeeping 结构。状态转换的实际逻辑由 `registry.rs`（`on_access` 处理加载触发与状态迁移动作）和 `monitor.rs`（`tick` 中完成 `Active` → `Idle` 迁移及卸载决策）驱动。
+- **`monitor.rs`**：实现 `IdleMonitor::tick()` 三阶段卸载算法。Phase 1 持锁扫描注册表，将引用计数为零且空闲超时的模块从 `Idle` 标记为 `Unloading`；Phase 2 在无锁环境下调用 `ModuleLoader::unload()` 执行实际卸载；Phase 3 再次持锁将成功卸载的模块状态回写为 `Unloaded`。该函数由 `api/src/kmod/ondemand.rs` 的 `tick_ondemand()` 定期调用。
 
-框架通过 trait `KmodOnDemandLoader` 与具体的操作系统解耦。该 trait 定义了三个方法：`load_module()`、`unload_module()` 和 `check_idle()`。StarryOS 在 `api/src/kmod/ondemand.rs` 中提供了该 trait 的实现，其内部调用现有的 `kmod-loader` 与 `axalloc` 内存管理接口。
+框架通过 `ModuleLoader` trait 与具体的操作系统解耦，定义了 `load()`、`unload()` 等方法。StarryOS 在 `api/src/kmod/ondemand.rs` 中提供 `KmodOnDemandLoader` 结构体作为该 trait 的具体实现，其内部调用现有的 `kmod-loader` 与 `axalloc` 内存管理接口。
 
 ### 4.2 `with_ondemand` VFS 集成
 
 `with_ondemand` 是一个泛型函数，其实现位于 `api/src/kmod/ondemand.rs`。以 `lookup` 为例：
 
 ```rust
-with_ondemand(path, || vfs.lookup(path))
+with_ondemand(&path, || fs.resolve(&path))
 ```
 
-宏展开后等价于一个循环：
+函数调用逻辑：
 
 1. 首次调用闭包 `vfs.lookup(path)`。
 2. 若返回 `Err(NotFound)`，提取路径中的前缀，查询 `registry` 是否有匹配。
 3. 若有匹配，调用 `try_load()`；加载成功后继续下一次循环（重试）。
 4. 若返回其他错误或连续重试次数超过上限，则直接返回错误。
 
-该宏被插入到 `lookup`、`open`、`read`、`write`、`mkdir`、`unlink` 等关键 VFS 路径中，确保几乎所有文件系统操作都能触发按需加载。
+该函数被包裹在 `open`、`stat`、`chmod`、`chown` 等关键系统调用路径中，确保几乎所有文件系统操作都能触发按需加载。
 
 ### 4.3 `FuseDev` 的并发与同步重构
 
 早期的 `/dev/fuse` 实现使用单线程自旋锁保护整个设备状态，导致当守护进程阻塞在 `read` 等待请求时，其他线程无法并发写入新请求。为此，本文对 `FuseDev` 进行了并发重构：
 
-- **引入 `PollSet`**：支持多线程同时 `poll` 或 `read`，内核可以在任意线程上向 `PollSet` 投递可读/可写事件。
+- **引入 `PollSet`**：支持多线程同时 `poll`，`read` 通过 `WaitQueue` 串行服务，内核可以在任意线程上向 `PollSet` 投递可读/可写事件。
 - **引入 `WaitQueue`**：当没有待处理请求时，`read` 调用将当前任务挂起到 `WaitQueue`；当有新的 VFS 请求到达时，由 `vfs` 层唤醒等待队列中的任务。
-- **锁粒度细化**：将全局自旋锁拆分为三把锁——`request_lock`（保护请求队列）、`session_lock`（保护 FUSE 会话状态）、`buffer_lock`（保护用户态读写缓冲区）。
+- **锁安全**：调用文件系统函数时先短暂拿锁检查请求队列，无数据则立即释放锁，再通过外部 WaitQueue 安全阻塞睡眠，消除"持自旋锁睡眠"导致的死锁风险。
 
 ### 4.4 `vfs.rs` 的协议桥接
 
 `vfs.rs` 是 `Starryfuse` 中最复杂的模块，负责将 StarryOS VFS 的语义映射到 FUSE 协议。
 
-**Opcode 映射**：`vfs.rs` 中所有 FUSE 请求的 opcode 均严格对照 Linux 内核头文件定义，确保与用户态守护进程的协议语义一致。例如 `FUSE_INIT` 使用 opcode `35`，与标准 FUSE ABI 对齐。
+**Opcode 映射**：`vfs.rs` 中所有 FUSE 请求的 opcode 均严格对照 Linux 内核头文件定义，确保与用户态守护进程的协议语义一致。例如 `FUSE_INIT` 使用 opcode `26`，与标准 FUSE ABI 对齐。
 
-**Metadata 同步**：`FUSE_LOOKUP` 和 `FUSE_GETATTR` 响应携带的文件属性（大小、权限、时间戳等）通过 `vfs.rs` 中的 `update_metadata()` 写回 VFS inode。当前实现中该函数暂为 no-op，inode 属性一致性由 VFS 层的属性缓存机制保证。
+**INIT 协议握手**：`FuseFs::new()` 注册文件系统后，在独立内核线程中异步发起 `FUSE_INIT` 握手，避免阻塞 `sys_mount`。构造 `FuseInitIn` 请求体携带主版本号、次版本号与 `max_readahead` 等能力字段下发至用户态守护进程，解析返回的 `FuseInitOut` 完成协议版本确认。
 
 ### 4.5 用户态 `starry_fuser` 库
 
@@ -194,15 +195,15 @@ with_ondemand(path, || vfs.lookup(path))
 为验证按需加载与 FUSE 功能的正确性，本文设计了三组测试程序：
 
 1. **`fuse_test`**：基础功能测试，验证 `/dev/fuse` 的按需加载、FUSE_INIT 握手、简单的 `lookup`/`read`/`readdir` 以及空闲卸载。
-2. **`fuse_rw_test`**：读写功能测试，验证 `write` + `read` 闭环、文件追加、截断、以及并发访问。
-3. **`fuse_mem_test`**：内存与稳定性测试，通过循环加载/卸载 FUSE 模块，观测内存占用是否回归基线，检测是否存在内存泄漏或 use-after-free。
+2. **`fuse_rw_test`**：读写功能测试，验证 `write` + `read` 闭环、文件截断覆盖、目录创建与遍历。
+3. **`fuse_mem_test`**：内存与稳定性测试，通过单次加载/卸载 FUSE 模块并读取内核内存快照，观测内存占用是否回归基线，检测是否存在内存泄漏。
 
 ### 5.2 测试环境
 
 - **目标平台**：`riscv64gc-unknown-none-elf`
 - **运行环境**：QEMU 7.2+ `virt` 机器
 - **内核配置**：开启 `KALLSYMS`、`LKM`、`ONDEMAND_KMOD`、`FUSE`
-- **测试方式**：在 QEMU 中通过 `init.sh` 自动启动测试程序，串口输出日志
+- **测试方式**：在 QEMU 中运行 StarryOS，启动测试程序，串口输出日志
 
 ### 5.3 测试结果
 
@@ -475,7 +476,7 @@ starry:~#
 | ‑ fuse.ko | 416 | — | — |
 | ‑ starryfuse libs | 655 | — | — |
 | B. On-demand mapped pages (loader vmalloc) | 68 | 17 | actual load |
-| D. Runtime overhead (mount/fork/VFS, transient) | 0 | 0 | transient |
+| D. Runtime overhead (mount/fork/VFS, transient) | 36 | 9 | transient |
 | **Memory saving vs static baseline** | **1,071** | — | resident reduction |
 
 从 **表 1** 可见，按需加载在 `After load` 阶段使内核页数增加了 17 页（约 68 KB），这是 `kmod-loader` 通过 `vmalloc` 映射 `.ko` 产生的实际内存开销。经过 FUSE 自测试验、卸载挂载点并等待 7 s 空闲超时后，模块进入 `Unloading` 状态，`KmodMem::drop` 逐页释放物理内存，最终 `After unload` 页数相比 `After load` 回落 17 页，证明模块占用的 ELF 内存被完全回收。
@@ -495,7 +496,7 @@ starry:~#
 ### 6.2 未来工作
 
 1. **块设备文件系统按需加载**：当前框架主要面向用户态文件系统与伪文件系统。未来可将其扩展至 `ext4`、`fat32` 等块设备文件系统。
-2. **完善 `starry_fuser` 功能集**：补充 `FUSE_MKNOD`、`FUSE_LINK`、`FUSE_IOCTL` 等高级操作码，提升与现有 `libfuse` 的兼容性。
+2. **完善 `starry_fuser` 功能集**：补充 `FUSE_MKNOD`、`FUSE_IOCTL` 等高级操作码，提升与现有 `libfuse` 的兼容性。
 3. **vDSO 与系统调用优化**：探索将部分 FUSE 请求路径通过 vDSO 优化，减少用户态/内核态切换次数。
 
 ---
